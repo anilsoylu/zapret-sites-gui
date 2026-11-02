@@ -11,6 +11,8 @@ systemctl disable --now zapret.service 2>/dev/null || true
 systemctl disable --now zapret-dns.service 2>/dev/null || true
 
 rm -f /etc/systemd/system/zapret.service /etc/systemd/system/zapret-dns.service
+rm -f /etc/systemd/system/systemd-resolved.service.d/zapret-dns-upholds.conf
+rmdir /etc/systemd/system/systemd-resolved.service.d 2>/dev/null || true
 systemctl daemon-reload
 
 ip link del zapretdns 2>/dev/null || true

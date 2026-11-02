@@ -45,7 +45,7 @@ Arayüzü kapatmak bypass'ı durdurmaz. Bypass'ı kapatmak için anahtarı kulla
 
 zapret'in `nfqws` bileşeni, seçili alan adlarına giden paketleri netfilter kuyruğundan geçirir ve TLS ClientHello paketini iki parçaya bölerek gönderir. DPI cihazı SNI alanını tek pakette göremediği için bağlantıyı engelleyemez. `MODE_FILTER=hostlist` sayesinde yalnızca `/opt/zapret/ipset/zapret-hosts-user.txt` içindeki alan adları bu işlemden geçer.
 
-DNS tarafında `zapretdns` adında bir dummy ağ arayüzü (`10.53.53.1/32`) oluşturulur. `resolvectl` ile bu arayüze Cloudflare DoT sunucuları atanır ve yalnızca listedeki alan adları bu arayüze yönlendirilir. Diğer alan adları sistemin normal DNS sunucusunu kullanır, yani split DNS uygulanır.
+DNS tarafında `zapretdns` adında bir dummy ağ arayüzü (`10.53.53.1/32`) oluşturulur. `resolvectl` ile bu arayüze Cloudflare DoT sunucuları atanır ve yalnızca listedeki alan adları bu arayüze yönlendirilir. Diğer alan adları sistemin normal DNS sunucusunu kullanır, yani split DNS uygulanır. `systemd-resolved` yeniden başlarsa paraçası (drop-in) DNS servisini geri başlatır ve kurulum yeniden uygulanır.
 
 Kurulan dosyalar:
 
@@ -59,6 +59,7 @@ Kurulan dosyalar:
 | `/usr/local/sbin/zapret-dns-teardown.sh` | Dummy arayüzü kaldırma |
 | `/etc/systemd/system/zapret.service` | Bypass servisi |
 | `/etc/systemd/system/zapret-dns.service` | DNS servisi |
+| `/etc/systemd/system/systemd-resolved.service.d/zapret-dns-upholds.conf` | `systemd-resolved` yeniden başladığında DNS kurulumunu yeniden uygulayan parça |
 | `/etc/sudoers.d/zapret-gui` | Yardımcı için NOPASSWD kuralı |
 
 Arayüz root olarak çalışmaz. Yalnızca `status`, `on`, `off` ve `set-list` komutlarını kabul eden yardımcıyı `sudo` ile çağırır. Sudoers kuralı tek bir dosyaya ve tek bir komuta izin verir.

@@ -43,7 +43,7 @@ Closing the window does not stop the bypass. Use the switch to turn it off.
 
 zapret's `nfqws` sends packets for the selected domains through a netfilter queue and splits the TLS ClientHello into two packets. The DPI device cannot see the SNI field in a single packet, so it cannot block the connection. `MODE_FILTER=hostlist` limits this to the domains in `/opt/zapret/ipset/zapret-hosts-user.txt`.
 
-For DNS, the app creates a dummy interface named `zapretdns` (`10.53.53.1/32`), assigns Cloudflare DoT servers to it with `resolvectl`, and routes only the listed domains to that interface. Other domains use the system resolver, so this is split DNS.
+For DNS, the app creates a dummy interface named `zapretdns` (`10.53.53.1/32`), assigns Cloudflare DoT servers to it with `resolvectl`, and routes only the listed domains to that interface. Other domains use the system resolver, so this is split DNS. A drop-in restarts the DNS service when `systemd-resolved` restarts, re-applying the setup.
 
 Installed files:
 
@@ -57,6 +57,7 @@ Installed files:
 | `/usr/local/sbin/zapret-dns-teardown.sh` | Removes the dummy interface |
 | `/etc/systemd/system/zapret.service` | Bypass service |
 | `/etc/systemd/system/zapret-dns.service` | DNS service |
+| `/etc/systemd/system/systemd-resolved.service.d/zapret-dns-upholds.conf` | Drop-in that re-runs the DNS setup when `systemd-resolved` restarts |
 | `/etc/sudoers.d/zapret-gui` | NOPASSWD rule for the helper |
 
 The GUI does not run as root. It calls the helper through `sudo`, and the helper accepts only `status`, `on`, `off` and `set-list`. The sudoers rule allows one command from one file.

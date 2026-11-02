@@ -77,6 +77,9 @@ install -m 755 "$HERE/src/zapret-dns-teardown.sh" /usr/local/sbin/zapret-dns-tea
 install -m 755 "$HERE/src/zapret-sites-gui" /usr/local/bin/zapret-sites-gui
 install -m 644 "$HERE/src/zapret.service" /etc/systemd/system/zapret.service
 install -m 644 "$HERE/src/zapret-dns.service" /etc/systemd/system/zapret-dns.service
+install -d -m 755 /etc/systemd/system/systemd-resolved.service.d
+install -m 644 "$HERE/src/systemd-resolved-upholds.conf" \
+  /etc/systemd/system/systemd-resolved.service.d/zapret-dns-upholds.conf
 
 log "Sudo kurali yaziliyor"
 printf '%s ALL=(root) NOPASSWD: /usr/local/libexec/zapret-gui-helper\n' "$TARGET_USER" \
