@@ -14,12 +14,7 @@ LIST = "/opt/zapret/ipset/zapret-hosts-user.txt"
 
 PRESETS = {
     "Discord": [
-        "discord.com", "discord.gg", "discord.media", "discordapp.com",
-        "discordapp.net", "discord.dev", "discord.co", "discord.new",
-        "discord.gift", "discord.gifts", "discord.design", "discord.store",
-        "discord.tools", "discordstatus.com", "dis.gd", "discordmerch.com",
-        "discordpartygames.com", "discord-activities.com",
-        "discordactivities.com", "discordcdn.com",
+        "discord.gg", "discord.com", "discordapp.com",
     ],
     "Instagram": [
         "instagram.com", "cdninstagram.com", "instagramstatic-a.akamaihd.net",
@@ -86,18 +81,23 @@ class Window(Adw.ApplicationWindow):
         # ---- hazır listeler ----
         g_presets = Adw.PreferencesGroup(
             title="Hazır listeler",
-            description="Tıkla, alan adları aşağıdaki listeye eklenir. Sonra Kaydet'e bas.",
+            description="Bir liste seç; alan adları aşağıya eklenir. Uygulamak için Kaydet'e bas.",
         )
-        row_presets = Adw.ActionRow(title="Ekle")
-        box = Gtk.Box(spacing=6)
-        box.set_valign(Gtk.Align.CENTER)
+        presets = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=2,
+            max_children_per_line=3,
+            row_spacing=8,
+            column_spacing=8,
+            homogeneous=True,
+        )
         for name, domains in PRESETS.items():
             btn = Gtk.Button(label=name)
             btn.add_css_class("pill")
+            btn.set_hexpand(True)
             btn.connect("clicked", self.on_preset, domains)
-            box.append(btn)
-        row_presets.add_suffix(box)
-        g_presets.add(row_presets)
+            presets.append(btn)
+        g_presets.add(presets)
         page.add(g_presets)
 
         # ---- alan adları ----
@@ -106,7 +106,8 @@ class Window(Adw.ApplicationWindow):
             description="Her satıra bir alan adı. Alt alan adları otomatik kapsanır.",
         )
         scroller = Gtk.ScrolledWindow()
-        scroller.set_min_content_height(250)
+        scroller.set_min_content_height(280)
+        scroller.set_vexpand(True)
         scroller.set_has_frame(True)
         self.view = Gtk.TextView()
         self.view.set_monospace(True)
@@ -118,14 +119,21 @@ class Window(Adw.ApplicationWindow):
         scroller.set_child(self.view)
         g_list.add(scroller)
 
-        row_actions = Adw.ActionRow(title="Değişiklikleri uygula")
+        row_actions = Gtk.Box(spacing=8)
+        row_actions.set_valign(Gtk.Align.CENTER)
+        row_actions.set_margin_top(8)
+        action_label = Gtk.Label(label="Listeyi uygulamaya hazır")
+        action_label.add_css_class("dim-label")
+        action_label.set_hexpand(True)
+        action_label.set_halign(Gtk.Align.START)
+        row_actions.append(action_label)
         btn_reload = Gtk.Button(label="Geri al")
         btn_reload.connect("clicked", lambda *_: self.load_list())
-        row_actions.add_suffix(btn_reload)
+        row_actions.append(btn_reload)
         btn_save = Gtk.Button(label="Kaydet")
         btn_save.add_css_class("suggested-action")
         btn_save.connect("clicked", self.on_save)
-        row_actions.add_suffix(btn_save)
+        row_actions.append(btn_save)
         g_list.add(row_actions)
         page.add(g_list)
 

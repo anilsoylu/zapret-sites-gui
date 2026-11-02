@@ -67,7 +67,7 @@ NFQWS_OPT="
 EOF
 
 install -d -m 755 "$PREFIX/ipset"
-install -m 644 "$HERE/lists/discord.txt" "$PREFIX/ipset/zapret-hosts-user.txt"
+install -m 644 "$HERE/lists/default-domains.txt" "$PREFIX/ipset/zapret-hosts-user.txt"
 
 log "Dosyalar kuruluyor"
 install -d -m 755 /usr/local/libexec /usr/local/sbin /usr/local/bin
