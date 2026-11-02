@@ -28,7 +28,7 @@ apt-get update -qq
 apt-get install -y -qq \
   build-essential libnetfilter-queue-dev libmnl-dev libnfnetlink-dev \
   zlib1g-dev libcap-dev ipset iptables nftables unzip curl ca-certificates \
-  python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+  python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-ayatanaappindicator3-0.1
 
 log "zapret v${ZAPRET_VER} indiriliyor"
 TMP="$(mktemp -d)"
@@ -76,6 +76,7 @@ install -m 755 "$HERE/src/zapret-gui-helper" /usr/local/libexec/zapret-gui-helpe
 install -m 755 "$HERE/src/zapret-dns-setup.sh" /usr/local/sbin/zapret-dns-setup.sh
 install -m 755 "$HERE/src/zapret-dns-teardown.sh" /usr/local/sbin/zapret-dns-teardown.sh
 install -m 755 "$HERE/src/zapret-sites-gui" /usr/local/bin/zapret-sites-gui
+install -m 755 "$HERE/src/zapret-sites-tray" /usr/local/libexec/zapret-sites-tray
 install -m 644 "$HERE/src/zapret.service" /etc/systemd/system/zapret.service
 install -m 644 "$HERE/src/zapret-dns.service" /etc/systemd/system/zapret-dns.service
 install -d -m 755 /etc/systemd/system/systemd-resolved.service.d
