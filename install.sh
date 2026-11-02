@@ -49,6 +49,7 @@ cp -a "$SRC"/. "$PREFIX"/
 make -C "$PREFIX" -j"$(nproc)" >/dev/null
 
 log "Yapilandirma yaziliyor"
+cp "$PREFIX/config.default" "$PREFIX/config"
 cat >> "$PREFIX/config" <<'EOF'
 
 # --- zapret-sites-gui ---
