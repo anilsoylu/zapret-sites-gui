@@ -1,0 +1,61 @@
+#!/usr/bin/python3
+"""GTK3 Ayatana indicator bridge for the GTK4 application."""
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3, Gio, Gtk, GLib
+
+APP_ID = "tr.anilsoylu.ZapretSites"
+APP_PATH = "/tr/anilsoylu/ZapretSites"
+
+
+def activate_action(name):
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    bus.call_sync(
+        APP_ID,
+        APP_PATH,
+        "org.gtk.Actions",
+        "Activate",
+        GLib.Variant("(sava{sv})", (name, [], {})),
+        None,
+        Gio.DBusCallFlags.NONE,
+        3000,
+        None,
+    )
+
+
+def on_open(_item):
+    try:
+        activate_action("show")
+    except GLib.Error as exc:
+        print(f"Site Erişimi penceresi açılamadı: {exc}", flush=True)
+
+
+def on_quit(_item):
+    try:
+        activate_action("quit")
+    except GLib.Error as exc:
+        print(f"Site Erişimi kapatılamadı: {exc}", flush=True)
+
+
+indicator = AyatanaAppIndicator3.Indicator.new(
+    "zapret-sites-gui",
+    "security-high-symbolic",
+    AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+)
+indicator.set_title("Site Erişimi")
+indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+menu = Gtk.Menu()
+open_item = Gtk.MenuItem(label="Pencereyi aç")
+open_item.connect("activate", on_open)
+menu.append(open_item)
+quit_item = Gtk.MenuItem(label="Çıkış")
+quit_item.connect("activate", on_quit)
+menu.append(quit_item)
+menu.show_all()
+indicator.set_menu(menu)
+indicator.set_secondary_activate_target(open_item)
+
+Gtk.main()

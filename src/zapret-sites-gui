@@ -10,6 +10,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, Gtk
 
 HELPER = "/usr/local/libexec/zapret-gui-helper"
+TRAY_HELPER = "/usr/local/libexec/zapret-sites-tray"
 LIST = "/opt/zapret/ipset/zapret-hosts-user.txt"
 
 PRESETS = {
@@ -57,15 +58,38 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title="Site Erişimi")
         self.set_default_size(660, 720)
         self._updating = False
+        self.connect("close-request", self.on_close_request)
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False)
         self.switch = Gtk.Switch(
             valign=Gtk.Align.CENTER,
             tooltip_text="DPI bypass aç / kapat",
         )
         self.switch.connect("state-set", self.on_switch)
-        header.pack_end(self.switch)
+        controls = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        controls.append(self.switch)
+
+        btn_tray = Gtk.Button.new_from_icon_name("window-minimize-symbolic")
+        btn_tray.set_tooltip_text("Tepsiye küçült")
+        btn_tray.add_css_class("flat")
+        btn_tray.connect("clicked", lambda *_: self.get_application().hide_window(self))
+        controls.append(btn_tray)
+
+        btn_maximize = Gtk.Button.new_from_icon_name("window-maximize-symbolic")
+        btn_maximize.set_tooltip_text("Büyüt / geri al")
+        btn_maximize.add_css_class("flat")
+        btn_maximize.connect("clicked", self.on_toggle_maximize)
+        self.connect("notify::maximized", self.on_maximized_changed, btn_maximize)
+        controls.append(btn_maximize)
+
+        btn_close = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        btn_close.set_tooltip_text("Tepsiye gönder")
+        btn_close.add_css_class("flat")
+        btn_close.connect("clicked", lambda *_: self.close())
+        controls.append(btn_close)
+        header.pack_end(controls)
         toolbar.add_top_bar(header)
 
         page = Adw.PreferencesPage()
@@ -171,6 +195,19 @@ class Window(Adw.ApplicationWindow):
         buf = self.view.get_buffer()
         return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
 
+    def on_toggle_maximize(self, _button):
+        self.unmaximize() if self.is_maximized() else self.maximize()
+
+    def on_maximized_changed(self, _window, _pspec, button):
+        maximized = self.is_maximized()
+        button.set_icon_name(
+            "window-restore-symbolic" if maximized else "window-maximize-symbolic"
+        )
+
+    def on_close_request(self, _window):
+        self.get_application().hide_window(self)
+        return True
+
     # ---------- eylemler ----------
     def load_list(self):
         try:
@@ -251,11 +288,49 @@ class App(Adw.Application):
             application_id="tr.anilsoylu.ZapretSites",
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
+        self.window = None
+        self.tray_process = None
+        self.connect("startup", self.on_startup)
         self.connect("activate", self.on_activate)
 
+    def on_startup(self, _app):
+        self.hold()
+        show_action = Gio.SimpleAction.new("show", None)
+        show_action.connect("activate", self.on_show_window)
+        self.add_action(show_action)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self.quit_from_indicator)
+        self.add_action(quit_action)
+        try:
+            self.tray_process = subprocess.Popen([TRAY_HELPER])
+        except OSError as exc:
+            print(f"Tepsi göstergesi başlatılamadı: {exc}", file=sys.stderr)
+
     def on_activate(self, _app):
-        win = Window(self)
-        win.present()
+        if self.window is None:
+            self.window = Window(self)
+        elif self.window not in self.get_windows():
+            self.add_window(self.window)
+        self.window.present()
+
+    def on_show_window(self, *_args):
+        self.on_activate(self)
+
+    def hide_window(self, window):
+        window.set_visible(False)
+        if window in self.get_windows():
+            self.remove_window(window)
+
+    def quit_from_indicator(self, *_args):
+        if self.tray_process is not None:
+            self.tray_process.terminate()
+            self.tray_process = None
+        if self.window is not None:
+            self.window.set_visible(False)
+            self.remove_window(self.window)
+            self.window = None
+        self.release()
+        self.quit()
 
 
 if __name__ == "__main__":
