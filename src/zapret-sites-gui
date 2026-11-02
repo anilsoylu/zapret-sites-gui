@@ -1,0 +1,254 @@
+#!/usr/bin/python3
+# Site Erisimi - zapret DPI bypass icin GTK4/libadwaita arayuzu
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, Gtk
+
+HELPER = "/usr/local/libexec/zapret-gui-helper"
+LIST = "/opt/zapret/ipset/zapret-hosts-user.txt"
+
+PRESETS = {
+    "Discord": [
+        "discord.com", "discord.gg", "discord.media", "discordapp.com",
+        "discordapp.net", "discord.dev", "discord.co", "discord.new",
+        "discord.gift", "discord.gifts", "discord.design", "discord.store",
+        "discord.tools", "discordstatus.com", "dis.gd", "discordmerch.com",
+        "discordpartygames.com", "discord-activities.com",
+        "discordactivities.com", "discordcdn.com",
+    ],
+    "Instagram": [
+        "instagram.com", "cdninstagram.com", "instagramstatic-a.akamaihd.net",
+    ],
+    "Roblox": [
+        "roblox.com", "rbxcdn.com", "rbx.com", "robloxlabs.com",
+    ],
+    "YouTube": [
+        "youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
+        "youtube-nocookie.com", "ggpht.com",
+    ],
+    "X / Twitter": [
+        "x.com", "twitter.com", "twimg.com", "t.co",
+    ],
+    "Telegram": [
+        "telegram.org", "t.me", "telegram.me", "tdesktop.com", "telesco.pe",
+    ],
+}
+
+
+def helper(args, stdin_text=None):
+    try:
+        return subprocess.run(
+            ["sudo", "-n", HELPER, *args],
+            input=stdin_text,
+            text=True,
+            capture_output=True,
+            timeout=90,
+        )
+    except Exception as exc:  # noqa: BLE001
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = str(exc)
+        return R()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Site Erişimi")
+        self.set_default_size(660, 720)
+        self._updating = False
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.switch = Gtk.Switch(
+            valign=Gtk.Align.CENTER,
+            tooltip_text="DPI bypass aç / kapat",
+        )
+        self.switch.connect("state-set", self.on_switch)
+        header.pack_end(self.switch)
+        toolbar.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        # ---- durum ----
+        g_status = Adw.PreferencesGroup(title="Durum")
+        self.row_state = Adw.ActionRow(title="Bypass")
+        g_status.add(self.row_state)
+        self.row_count = Adw.ActionRow(title="Kapsanan alan adı")
+        g_status.add(self.row_count)
+        page.add(g_status)
+
+        # ---- hazır listeler ----
+        g_presets = Adw.PreferencesGroup(
+            title="Hazır listeler",
+            description="Tıkla, alan adları aşağıdaki listeye eklenir. Sonra Kaydet'e bas.",
+        )
+        row_presets = Adw.ActionRow(title="Ekle")
+        box = Gtk.Box(spacing=6)
+        box.set_valign(Gtk.Align.CENTER)
+        for name, domains in PRESETS.items():
+            btn = Gtk.Button(label=name)
+            btn.add_css_class("pill")
+            btn.connect("clicked", self.on_preset, domains)
+            box.append(btn)
+        row_presets.add_suffix(box)
+        g_presets.add(row_presets)
+        page.add(g_presets)
+
+        # ---- alan adları ----
+        g_list = Adw.PreferencesGroup(
+            title="Alan adları",
+            description="Her satıra bir alan adı. Alt alan adları otomatik kapsanır.",
+        )
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_min_content_height(250)
+        scroller.set_has_frame(True)
+        self.view = Gtk.TextView()
+        self.view.set_monospace(True)
+        self.view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.view.set_left_margin(10)
+        self.view.set_right_margin(10)
+        self.view.set_top_margin(8)
+        self.view.set_bottom_margin(8)
+        scroller.set_child(self.view)
+        g_list.add(scroller)
+
+        row_actions = Adw.ActionRow(title="Değişiklikleri uygula")
+        btn_reload = Gtk.Button(label="Geri al")
+        btn_reload.connect("clicked", lambda *_: self.load_list())
+        row_actions.add_suffix(btn_reload)
+        btn_save = Gtk.Button(label="Kaydet")
+        btn_save.add_css_class("suggested-action")
+        btn_save.connect("clicked", self.on_save)
+        row_actions.add_suffix(btn_save)
+        g_list.add(row_actions)
+        page.add(g_list)
+
+        # ---- bilgi ----
+        g_info = Adw.PreferencesGroup()
+        self.row_info = Adw.ActionRow(
+            title="Nasıl çalışır?",
+            subtitle="Seçili alan adları DPI bypass ile açılır ve DNS'i şifreli çözülür. "
+                     "Listede olmayan siteler doğrudan, normal hızda çalışır.",
+        )
+        g_info.add(self.row_info)
+        page.add(g_info)
+
+        toolbar.set_content(page)
+        self.toasts = Adw.ToastOverlay()
+        self.toasts.set_child(toolbar)
+        self.set_content(self.toasts)
+
+        self.load_list()
+        self.refresh()
+
+    # ---------- yardımcılar ----------
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=2))
+
+    def show_error(self, msg):
+        try:
+            dlg = Adw.AlertDialog(heading="Hata", body=msg or "Bilinmeyen hata")
+            dlg.add_response("ok", "Tamam")
+            dlg.present(self)
+        except Exception:  # noqa: BLE001
+            self.row_info.set_subtitle(msg)
+
+    def read_buffer(self):
+        buf = self.view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    # ---------- eylemler ----------
+    def load_list(self):
+        try:
+            with open(LIST, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            text = "discord.com\n"
+        self.view.get_buffer().set_text(text)
+        self.update_count(text)
+
+    def update_count(self, text=None):
+        if text is None:
+            text = self.read_buffer()
+        n = len([ln for ln in text.splitlines() if ln.strip()])
+        self.row_count.set_subtitle(f"{n} alan adı")
+
+    def refresh(self):
+        self._updating = True
+        res = helper(["status"])
+        values = {}
+        for line in res.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip()
+        active = values.get("zapret") == "active"
+        dns = values.get("dns") == "active"
+        self.switch.set_active(active)
+        self._updating = False
+
+        if active:
+            self.row_state.set_subtitle("Aktif — seçili siteler DPI bypass ile açılıyor")
+        else:
+            self.row_state.set_subtitle("Kapalı — tüm trafik normal")
+        self.row_count.set_subtitle(
+            f"{len([ln for ln in self.read_buffer().splitlines() if ln.strip()])} alan adı"
+            + ("" if dns else "  ·  DNS servisi kapalı")
+        )
+
+    def on_switch(self, _switch, state):
+        if self._updating:
+            return False
+        res = helper(["on"] if state else ["off"])
+        if res.returncode != 0:
+            self.show_error(res.stderr.strip())
+        else:
+            self.toast("Bypass açıldı" if state else "Bypass kapatıldı")
+        self.refresh()
+        return True
+
+    def on_save(self, _btn):
+        text = self.read_buffer()
+        res = helper(["set-list"], text)
+        if res.returncode != 0:
+            self.show_error(res.stderr.strip())
+            return
+        self.load_list()
+        self.refresh()
+        self.toast("Kaydedildi ve uygulandı")
+
+    def on_preset(self, _btn, domains):
+        text = self.read_buffer()
+        existing = {ln.strip() for ln in text.splitlines() if ln.strip()}
+        add = [d for d in domains if d not in existing]
+        if not add:
+            self.toast("Bu liste zaten ekli")
+            return
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n".join(add) + "\n"
+        self.view.get_buffer().set_text(text)
+        self.update_count(text)
+        self.toast(f"{len(add)} alan adı eklendi — Kaydet'e bas")
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(
+            application_id="tr.anilsoylu.ZapretSites",
+            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+        )
+        self.connect("activate", self.on_activate)
+
+    def on_activate(self, _app):
+        win = Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    App().run(sys.argv)

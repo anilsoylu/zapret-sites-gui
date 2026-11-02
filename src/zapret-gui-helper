@@ -1,0 +1,52 @@
+#!/bin/bash
+# zapret GUI yardimcisi - yalnizca root tarafindan, sinirli komutlarla calisir.
+set -euo pipefail
+LIST=/opt/zapret/ipset/zapret-hosts-user.txt
+cmd="${1:-}"
+
+case "$cmd" in
+  status)
+    printf 'zapret=%s\n' "$(systemctl is-active zapret 2>/dev/null || true)"
+    printf 'dns=%s\n' "$(systemctl is-active zapret-dns.service 2>/dev/null || true)"
+    ;;
+  on)
+    systemctl enable zapret-dns.service >/dev/null 2>&1 || true
+    systemctl enable zapret >/dev/null 2>&1 || true
+    systemctl start zapret-dns.service
+    systemctl start zapret
+    echo "ok"
+    ;;
+  off)
+    systemctl disable --now zapret >/dev/null 2>&1 || true
+    systemctl disable --now zapret-dns.service >/dev/null 2>&1 || true
+    echo "ok"
+    ;;
+  set-list)
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+    count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -z "$line" ] && continue
+      if ! [[ "$line" =~ ^[A-Za-z0-9*._-]+$ ]]; then
+        echo "Gecersiz alan adi: $line" >&2
+        exit 2
+      fi
+      printf '%s\n' "$line" >> "$tmp"
+      count=$((count+1))
+    done
+    if [ "$count" -eq 0 ]; then
+      echo "Liste bos olamaz" >&2
+      exit 2
+    fi
+    install -m 644 -o root -g root "$tmp" "$LIST"
+    systemctl is-active --quiet zapret-dns.service && systemctl restart zapret-dns.service || true
+    systemctl is-active --quiet zapret && systemctl restart zapret || true
+    echo "ok=$count"
+    ;;
+  *)
+    echo "kullanim: $0 status|on|off|set-list" >&2
+    exit 1
+    ;;
+esac

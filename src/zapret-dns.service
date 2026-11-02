@@ -1,0 +1,14 @@
+[Unit]
+Description=Split DNS for bypassed sites (Cloudflare DoT)
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+Requires=systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zapret-dns-setup.sh
+ExecStop=/usr/local/sbin/zapret-dns-teardown.sh
+
+[Install]
+WantedBy=multi-user.target
