@@ -1,52 +1,66 @@
 #!/bin/bash
-# zapret GUI yardimcisi - yalnizca root tarafindan, sinirli komutlarla calisir.
+# Root helper for the Site Access GUI. Runs through a single sudoers rule and
+# accepts only the commands below. Every command ends by printing the service state.
 set -euo pipefail
 LIST=/opt/zapret/ipset/zapret-hosts-user.txt
+DNS_SETUP=/usr/local/sbin/zapret-dns-setup.sh
 cmd="${1:-}"
+
+print_status() {
+  # One systemctl call; it prints one state per unit, in argument order.
+  local states zapret_state dns_state
+  states="$(systemctl is-active zapret zapret-dns.service 2>/dev/null || true)"
+  { read -r zapret_state || true; read -r dns_state || true; } <<<"$states"
+  printf 'zapret=%s\ndns=%s\n' "$zapret_state" "$dns_state"
+}
 
 case "$cmd" in
   status)
-    printf 'zapret=%s\n' "$(systemctl is-active zapret 2>/dev/null || true)"
-    printf 'dns=%s\n' "$(systemctl is-active zapret-dns.service 2>/dev/null || true)"
+    print_status
     ;;
   on)
     systemctl enable zapret-dns.service >/dev/null 2>&1 || true
     systemctl enable zapret >/dev/null 2>&1 || true
     systemctl start zapret-dns.service
     systemctl start zapret
-    echo "ok"
+    print_status
     ;;
   off)
     systemctl disable --now zapret >/dev/null 2>&1 || true
     systemctl disable --now zapret-dns.service >/dev/null 2>&1 || true
-    echo "ok"
+    print_status
     ;;
   set-list)
-    tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' EXIT
-    count=0
+    domains=()
     while IFS= read -r line || [ -n "$line" ]; do
+      # Trim CR and surrounding whitespace with parameter expansion (no fork per line).
       line="${line%$'\r'}"
-      line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
       [ -z "$line" ] && continue
       if ! [[ "$line" =~ ^[A-Za-z0-9*._-]+$ ]]; then
-        echo "Gecersiz alan adi: $line" >&2
+        echo "Invalid domain: $line" >&2
         exit 2
       fi
-      printf '%s\n' "$line" >> "$tmp"
-      count=$((count+1))
+      domains+=("$line")
     done
-    if [ "$count" -eq 0 ]; then
-      echo "Liste bos olamaz" >&2
+    if [ "${#domains[@]}" -eq 0 ]; then
+      echo "The list cannot be empty" >&2
       exit 2
     fi
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+    printf '%s\n' "${domains[@]}" > "$tmp"
     install -m 644 -o root -g root "$tmp" "$LIST"
-    systemctl is-active --quiet zapret-dns.service && systemctl restart zapret-dns.service || true
-    systemctl is-active --quiet zapret && systemctl restart zapret || true
-    echo "ok=$count"
+    # nfqws reloads the hostlist on its own when the file changes; only split DNS
+    # needs its routing domains re-applied.
+    if systemctl is-active --quiet zapret-dns.service; then
+      "$DNS_SETUP" domains
+    fi
+    print_status
     ;;
   *)
-    echo "kullanim: $0 status|on|off|set-list" >&2
+    echo "usage: $0 status|on|off|set-list" >&2
     exit 1
     ;;
 esac

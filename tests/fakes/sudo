@@ -1,0 +1,4 @@
+#!/bin/bash
+# Test double: the container already runs as root, so drop "-n" and run the command.
+[ "${1:-}" = "-n" ] && shift
+exec "$@"

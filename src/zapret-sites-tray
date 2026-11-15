@@ -1,13 +1,24 @@
 #!/usr/bin/python3
-"""GTK3 Ayatana indicator bridge for the GTK4 application."""
+"""GTK 3 Ayatana indicator bridge for the GTK 4 application.
+
+The app writes "on" or "off" lines to stdin to switch the icon. When stdin closes
+(the app exited or crashed), the indicator exits too.
+"""
+import os
+import sys
+
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3, Gio, Gtk, GLib
+from gi.repository import AyatanaAppIndicator3, Gio, GLib, Gtk
 
 APP_ID = "tr.anilsoylu.ZapretSites"
 APP_PATH = "/tr/anilsoylu/ZapretSites"
+STATE_ICONS = {
+    "on": ("network-vpn-symbolic", "Bypass açık"),
+    "off": ("network-vpn-disabled-symbolic", "Bypass kapalı"),
+}
 
 
 def activate_action(name):
@@ -25,23 +36,30 @@ def activate_action(name):
     )
 
 
-def on_open(_item):
+def on_action(_item, name):
     try:
-        activate_action("show")
+        activate_action(name)
     except GLib.Error as exc:
-        print(f"Site Erişimi penceresi açılamadı: {exc}", flush=True)
+        print(f"Site Access action '{name}' failed: {exc}", flush=True)
 
 
-def on_quit(_item):
+def on_stdin(fd, _condition):
     try:
-        activate_action("quit")
-    except GLib.Error as exc:
-        print(f"Site Erişimi kapatılamadı: {exc}", flush=True)
+        data = os.read(fd, 4096)
+    except OSError:
+        data = b""
+    if not data:
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+    lines = data.decode(errors="ignore").split()
+    if lines and lines[-1] in STATE_ICONS:
+        indicator.set_icon_full(*STATE_ICONS[lines[-1]])
+    return GLib.SOURCE_CONTINUE
 
 
 indicator = AyatanaAppIndicator3.Indicator.new(
     "zapret-sites-gui",
-    "security-high-symbolic",
+    STATE_ICONS["off"][0],
     AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
 )
 indicator.set_title("Site Erişimi")
@@ -49,13 +67,21 @@ indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
 
 menu = Gtk.Menu()
 open_item = Gtk.MenuItem(label="Pencereyi aç")
-open_item.connect("activate", on_open)
+open_item.connect("activate", on_action, "show")
 menu.append(open_item)
 quit_item = Gtk.MenuItem(label="Çıkış")
-quit_item.connect("activate", on_quit)
+quit_item.connect("activate", on_action, "quit")
 menu.append(quit_item)
 menu.show_all()
 indicator.set_menu(menu)
 indicator.set_secondary_activate_target(open_item)
+
+if not os.isatty(sys.stdin.fileno()):
+    GLib.unix_fd_add_full(
+        GLib.PRIORITY_DEFAULT,
+        sys.stdin.fileno(),
+        GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+        on_stdin,
+    )
 
 Gtk.main()
