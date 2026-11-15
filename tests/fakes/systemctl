@@ -1,0 +1,27 @@
+#!/bin/bash
+# Test double for systemctl: keeps unit state in files under $FAKE_SYSTEMD_DIR.
+dir="${FAKE_SYSTEMD_DIR:-/tmp/fake-systemd}"
+mkdir -p "$dir"
+quiet=0 now=0 args=()
+for a in "$@"; do
+  case "$a" in --quiet) quiet=1 ;; --now) now=1 ;; *) args+=("$a") ;; esac
+done
+verb="${args[0]}"
+units=("${args[@]:1}")
+units=("${units[@]%.service}")
+echo "$verb ${units[*]}" >> "$dir/calls.log"
+case "$verb" in
+  is-active)
+    rc=0
+    for unit in "${units[@]}"; do
+      state="$(cat "$dir/$unit" 2>/dev/null || echo inactive)"
+      [ "$quiet" -eq 1 ] || echo "$state"
+      [ "$state" = active ] || rc=3
+    done
+    exit $rc ;;
+  start) sleep "${FAKE_START_DELAY:-0}"; echo active > "$dir/${units[0]}" ;;
+  stop) echo inactive > "$dir/${units[0]}" ;;
+  disable) [ "$now" -eq 1 ] && echo inactive > "$dir/${units[0]}"; true ;;
+  enable) true ;;
+  *) exit 1 ;;
+esac
