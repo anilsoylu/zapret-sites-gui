@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-# Site Erisimi - zapret DPI bypass icin GTK4/libadwaita arayuzu
+"""Site Access: a GTK 4 / libadwaita front end for the zapret DPI bypass."""
+import re
 import subprocess
 import sys
 
@@ -7,11 +8,15 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+APP_ID = "tr.anilsoylu.ZapretSites"
 HELPER = "/usr/local/libexec/zapret-gui-helper"
 TRAY_HELPER = "/usr/local/libexec/zapret-sites-tray"
 LIST = "/opt/zapret/ipset/zapret-hosts-user.txt"
+HELPER_TIMEOUT_S = 90
+# Mirrors the root helper's rule; the helper remains the enforcing check.
+DOMAIN_RE = re.compile(r"[A-Za-z0-9*._-]+")
 
 PRESETS = {
     "Discord": [
@@ -35,302 +40,639 @@ PRESETS = {
     ],
 }
 
+CSS = """
+.hero { padding: 18px 20px; }
+.hero-badge {
+  min-width: 56px;
+  min-height: 56px;
+  border-radius: 9999px;
+  background-color: alpha(currentColor, 0.08);
+  transition: background-color 200ms ease-out, color 200ms ease-out;
+}
+.hero.on .hero-badge {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+.hero.warning .hero-badge {
+  background-color: alpha(@warning_color, 0.15);
+  color: @warning_color;
+}
+"""
 
-def helper(args, stdin_text=None):
+
+# ---------- pure helpers ----------
+
+def parse_domains(text):
+    """Split text into (valid, invalid) unique, lower-cased domains, keeping their order."""
+    valid, invalid, seen = [], [], set()
+    for line in text.splitlines():
+        domain = line.strip().lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        (valid if DOMAIN_RE.fullmatch(domain) else invalid).append(domain)
+    return valid, invalid
+
+
+def parse_status(stdout):
+    """Read the helper's key=value status lines."""
+    values = {}
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def enabled_presets(domains):
+    present = set(domains)
+    return {name for name, items in PRESETS.items() if present.issuperset(items)}
+
+
+def custom_domains(domains):
+    """Domains not covered by a fully enabled preset."""
+    covered = {d for name in enabled_presets(domains) for d in PRESETS[name]}
+    return [d for d in domains if d not in covered]
+
+
+def read_list():
     try:
-        return subprocess.run(
-            ["sudo", "-n", HELPER, *args],
-            input=stdin_text,
-            text=True,
-            capture_output=True,
-            timeout=90,
-        )
-    except Exception as exc:  # noqa: BLE001
-        class R:
-            returncode = 1
-            stdout = ""
-            stderr = str(exc)
-        return R()
+        with open(LIST, encoding="utf-8") as fh:
+            return parse_domains(fh.read())[0]
+    except OSError:
+        return ["discord.com"]
 
+
+def new_spinner(size=None):
+    """Adw.Spinner needs libadwaita 1.6; Ubuntu 24.04 ships 1.5."""
+    kwargs = {"halign": Gtk.Align.CENTER, "valign": Gtk.Align.CENTER}
+    if size:
+        kwargs.update(width_request=size, height_request=size)
+    if hasattr(Adw, "Spinner"):
+        return Adw.Spinner(**kwargs)
+    return Gtk.Spinner(spinning=True, **kwargs)
+
+
+# Adw.ShortcutsDialog needs libadwaita 1.8.
+HAS_SHORTCUTS_DIALOG = hasattr(Adw, "ShortcutsDialog")
+
+
+def run_helper(args, callback, stdin_text=None):
+    """Run the root helper without blocking the main loop; calls callback(ok, stdout, stderr)."""
+    flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+    if stdin_text is not None:
+        flags |= Gio.SubprocessFlags.STDIN_PIPE
+    try:
+        proc = Gio.Subprocess.new(["sudo", "-n", HELPER, *args], flags)
+    except GLib.Error as exc:
+        GLib.idle_add(callback, False, "", exc.message)
+        return
+
+    cancellable = Gio.Cancellable()
+    timeout_id = 0
+
+    def on_timeout():
+        nonlocal timeout_id
+        timeout_id = 0
+        cancellable.cancel()
+        proc.force_exit()
+        return GLib.SOURCE_REMOVE
+
+    def on_done(source, result):
+        if timeout_id:
+            GLib.source_remove(timeout_id)
+        try:
+            _ok, out, err = source.communicate_utf8_finish(result)
+        except GLib.Error as exc:
+            message = "Zaman aşımı" if cancellable.is_cancelled() else exc.message
+            callback(False, "", message)
+            return
+        callback(source.get_successful(), out or "", err or "")
+
+    timeout_id = GLib.timeout_add_seconds(HELPER_TIMEOUT_S, on_timeout)
+    proc.communicate_utf8_async(stdin_text, cancellable, on_done)
+
+
+# ---------- application (state + helper calls) ----------
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.window = None
+        self.tray = None
+        self.tray_state = None
+        self.saved = []
+        self.draft = []
+        self.status = None  # None while unknown, {} when the helper failed
+        self.busy = False
+        self.target = None  # requested on/off state while the helper is running
+        self.seq = 0  # bumped by every action so stale status replies are dropped
+        self.list_expanded = False
+
+    # -- lifecycle --
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        self.hold()
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        actions = [
+            ("show", lambda *_: self.activate(), []),
+            ("quit", lambda *_: self.quit_app(), ["<Control>q"]),
+            ("hide", lambda *_: self.hide_window(), ["<Control>w"]),
+            ("apply", lambda *_: self.apply(), ["<Control>s"]),
+            ("revert", lambda *_: self.revert(), []),
+            ("edit-text", lambda *_: self.window and self.window.open_text_editor(), ["<Control>e"]),
+            ("about", lambda *_: self.window and self.window.open_about(), []),
+        ]
+        if HAS_SHORTCUTS_DIALOG:
+            actions.append(
+                ("shortcuts", lambda *_: self.window and self.window.open_shortcuts(), ["<Control>question"])
+            )
+        for name, handler, accels in actions:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+            if accels:
+                self.set_accels_for_action(f"app.{name}", accels)
+        self.saved = read_list()
+        self.draft = list(self.saved)
+        self.start_tray()
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Window(self)
+        self.window.present()
+        self.refresh_status()
+
+    def hide_window(self):
+        if self.window is not None:
+            self.window.close()
+
+    def on_window_closed(self):
+        # The window is destroyed, not hidden, so no GPU surfaces stay alive in the tray.
+        self.window = None
+
+    def quit_app(self):
+        if self.tray is not None:
+            self.tray.terminate()
+            self.tray = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+        self.release()
+        self.quit()
+
+    # -- derived state --
+    @property
+    def active(self):
+        return bool(self.status) and self.status.get("zapret") == "active"
+
+    @property
+    def changes(self):
+        return len(set(self.draft) ^ set(self.saved))
+
+    @property
+    def can_apply(self):
+        return not self.busy and bool(self.draft) and bool(self.changes)
+
+    # -- draft edits --
+    def add_domain(self, domain):
+        if domain not in self.draft:
+            self.draft.append(domain)
+            self.update()
+
+    def remove_domain(self, domain):
+        self.draft.remove(domain)
+        self.update()
+
+    def set_preset(self, name, enabled):
+        items = PRESETS[name]
+        if enabled:
+            self.draft += [d for d in items if d not in self.draft]
+        else:
+            self.draft = [d for d in self.draft if d not in items]
+        self.update()
+
+    def replace_draft(self, domains):
+        self.draft = domains
+        self.update()
+
+    def revert(self):
+        self.draft = list(self.saved)
+        self.update()
+
+    # -- helper calls --
+    def refresh_status(self):
+        if self.busy:
+            return
+        seq = self.seq
+
+        def done(ok, out, _err):
+            if seq != self.seq:
+                return
+            self.status = parse_status(out) if ok else {}
+            self.update()
+
+        run_helper(["status"], done)
+
+    def set_enabled(self, enabled):
+        self.target = enabled
+        self.call_helper(["on" if enabled else "off"], "Bypass açıldı" if enabled else "Bypass kapatıldı")
+
+    def apply(self):
+        if not self.can_apply:
+            return
+        domains = list(self.draft)
+
+        def saved():
+            self.saved = domains
+
+        self.call_helper(["set-list"], "Liste uygulandı", "\n".join(domains) + "\n", saved)
+
+    def call_helper(self, args, done_message, stdin_text=None, on_success=None):
+        self.seq += 1
+        self.busy = True
+        self.update()
+
+        def done(ok, out, err):
+            self.busy = False
+            self.target = None
+            status = parse_status(out)
+            if status:
+                self.status = status
+            if ok:
+                if on_success:
+                    on_success()
+                if self.window is not None:
+                    self.window.toast(done_message)
+            else:
+                message = err.strip() or "Bilinmeyen hata"
+                if self.window is not None:
+                    self.window.show_error(message)
+                else:
+                    print(f"Site Access: {message}", file=sys.stderr)
+                if not status:
+                    self.refresh_status()  # a failed command may leave services half-changed
+            self.update()
+
+        run_helper(args, done, stdin_text)
+
+    # -- output --
+    def update(self):
+        self.lookup_action("apply").set_enabled(self.can_apply)
+        self.lookup_action("revert").set_enabled(not self.busy and bool(self.changes))
+        if self.window is not None:
+            self.window.render()
+        self.update_tray()
+
+    # -- tray --
+    def start_tray(self):
+        try:
+            self.tray = subprocess.Popen([TRAY_HELPER], stdin=subprocess.PIPE, text=True)
+        except OSError as exc:
+            print(f"Could not start the tray indicator: {exc}", file=sys.stderr)
+
+    def update_tray(self):
+        state = "on" if self.active else "off"
+        if self.tray is None or state == self.tray_state:
+            return
+        try:
+            self.tray.stdin.write(state + "\n")
+            self.tray.stdin.flush()
+            self.tray_state = state
+        except OSError:
+            self.tray = None
+
+
+# ---------- window (view) ----------
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Site Erişimi")
-        self.set_default_size(660, 720)
-        self._updating = False
+        super().__init__(application=app, title="Site Erişimi", default_width=560, default_height=720)
+        self.app = app
+        self.rendering = False
+        self.shown_custom = None
+        self.domain_rows = []
+        self.set_size_request(360, 480)
         self.connect("close-request", self.on_close_request)
 
-        toolbar = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        header.set_show_end_title_buttons(False)
-        self.switch = Gtk.Switch(
-            valign=Gtk.Align.CENTER,
-            tooltip_text="DPI bypass aç / kapat",
+        toolbar = Adw.ToolbarView(bottom_bar_style=Adw.ToolbarStyle.RAISED)
+        toolbar.add_top_bar(self.build_header())
+        self.banner = Adw.Banner(
+            title="DNS servisi çalışmıyor, listedeki siteler açılmayabilir",
+            button_label="Yeniden başlat",
         )
-        self.switch.connect("state-set", self.on_switch)
-        controls = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
-        controls.append(self.switch)
-
-        btn_tray = Gtk.Button.new_from_icon_name("window-minimize-symbolic")
-        btn_tray.set_tooltip_text("Tepsiye küçült")
-        btn_tray.add_css_class("flat")
-        btn_tray.connect("clicked", lambda *_: self.get_application().hide_window(self))
-        controls.append(btn_tray)
-
-        btn_maximize = Gtk.Button.new_from_icon_name("window-maximize-symbolic")
-        btn_maximize.set_tooltip_text("Büyüt / geri al")
-        btn_maximize.add_css_class("flat")
-        btn_maximize.connect("clicked", self.on_toggle_maximize)
-        self.connect("notify::maximized", self.on_maximized_changed, btn_maximize)
-        controls.append(btn_maximize)
-
-        btn_close = Gtk.Button.new_from_icon_name("window-close-symbolic")
-        btn_close.set_tooltip_text("Tepsiye gönder")
-        btn_close.add_css_class("flat")
-        btn_close.connect("clicked", lambda *_: self.close())
-        controls.append(btn_close)
-        header.pack_end(controls)
-        toolbar.add_top_bar(header)
+        self.banner.connect("button-clicked", lambda *_: app.set_enabled(True))
+        toolbar.add_top_bar(self.banner)
 
         page = Adw.PreferencesPage()
-
-        # ---- durum ----
-        g_status = Adw.PreferencesGroup(title="Durum")
-        self.row_state = Adw.ActionRow(title="Bypass")
-        g_status.add(self.row_state)
-        self.row_count = Adw.ActionRow(title="Kapsanan alan adı")
-        g_status.add(self.row_count)
-        page.add(g_status)
-
-        # ---- hazır listeler ----
-        g_presets = Adw.PreferencesGroup(
-            title="Hazır listeler",
-            description="Bir liste seç; alan adları aşağıya eklenir. Uygulamak için Kaydet'e bas.",
-        )
-        presets = Gtk.FlowBox(
-            selection_mode=Gtk.SelectionMode.NONE,
-            min_children_per_line=2,
-            max_children_per_line=3,
-            row_spacing=8,
-            column_spacing=8,
-            homogeneous=True,
-        )
-        for name, domains in PRESETS.items():
-            btn = Gtk.Button(label=name)
-            btn.add_css_class("pill")
-            btn.set_hexpand(True)
-            btn.connect("clicked", self.on_preset, domains)
-            presets.append(btn)
-        g_presets.add(presets)
-        page.add(g_presets)
-
-        # ---- alan adları ----
-        g_list = Adw.PreferencesGroup(
-            title="Alan adları",
-            description="Her satıra bir alan adı. Alt alan adları otomatik kapsanır.",
-        )
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_min_content_height(280)
-        scroller.set_vexpand(True)
-        scroller.set_has_frame(True)
-        self.view = Gtk.TextView()
-        self.view.set_monospace(True)
-        self.view.set_wrap_mode(Gtk.WrapMode.NONE)
-        self.view.set_left_margin(10)
-        self.view.set_right_margin(10)
-        self.view.set_top_margin(8)
-        self.view.set_bottom_margin(8)
-        scroller.set_child(self.view)
-        g_list.add(scroller)
-
-        row_actions = Gtk.Box(spacing=8)
-        row_actions.set_valign(Gtk.Align.CENTER)
-        row_actions.set_margin_top(8)
-        action_label = Gtk.Label(label="Listeyi uygulamaya hazır")
-        action_label.add_css_class("dim-label")
-        action_label.set_hexpand(True)
-        action_label.set_halign(Gtk.Align.START)
-        row_actions.append(action_label)
-        btn_reload = Gtk.Button(label="Geri al")
-        btn_reload.connect("clicked", lambda *_: self.load_list())
-        row_actions.append(btn_reload)
-        btn_save = Gtk.Button(label="Kaydet")
-        btn_save.add_css_class("suggested-action")
-        btn_save.connect("clicked", self.on_save)
-        row_actions.append(btn_save)
-        g_list.add(row_actions)
-        page.add(g_list)
-
-        # ---- bilgi ----
-        g_info = Adw.PreferencesGroup()
-        self.row_info = Adw.ActionRow(
-            title="Nasıl çalışır?",
-            subtitle="Seçili alan adları DPI bypass ile açılır ve DNS'i şifreli çözülür. "
-                     "Listede olmayan siteler doğrudan, normal hızda çalışır.",
-        )
-        g_info.add(self.row_info)
-        page.add(g_info)
-
+        page.add(self.build_hero())
+        page.add(self.build_presets())
+        page.add(self.build_domains())
         toolbar.set_content(page)
-        self.toasts = Adw.ToastOverlay()
-        self.toasts.set_child(toolbar)
+        toolbar.add_bottom_bar(self.build_apply_bar())
+        self.toolbar = toolbar
+
+        self.toasts = Adw.ToastOverlay(child=toolbar)
         self.set_content(self.toasts)
+        self.render()
 
-        self.load_list()
-        self.refresh()
+    # -- construction --
+    def build_header(self):
+        header = Adw.HeaderBar(show_end_title_buttons=False)
+        controls = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        buttons = {}
+        for icon, tooltip, handler in (
+            ("window-minimize-symbolic", "Tepsiye küçült", lambda *_: self.app.hide_window()),
+            ("window-maximize-symbolic", "Büyüt / geri al", self.on_toggle_maximize),
+            ("window-close-symbolic", "Tepsiye gönder", lambda *_: self.close()),
+        ):
+            buttons[icon] = Gtk.Button(icon_name=icon, tooltip_text=tooltip, css_classes=["flat"])
+            buttons[icon].connect("clicked", handler)
+            controls.append(buttons[icon])
+        self.connect("notify::maximized", self.on_maximized_changed, buttons["window-maximize-symbolic"])
+        header.pack_end(controls)
 
-    # ---------- yardımcılar ----------
-    def toast(self, text):
-        self.toasts.add_toast(Adw.Toast(title=text, timeout=2))
+        menu = Gio.Menu()
+        menu.append("Metin olarak düzenle", "app.edit-text")
+        info = Gio.Menu()
+        if HAS_SHORTCUTS_DIALOG:
+            info.append("Klavye kısayolları", "app.shortcuts")
+        info.append("Site Erişimi hakkında", "app.about")
+        menu.append_section(None, info)
+        end = Gio.Menu()
+        end.append("Çıkış", "app.quit")
+        menu.append_section(None, end)
+        header.pack_end(Gtk.MenuButton(
+            icon_name="open-menu-symbolic", menu_model=menu, primary=True, tooltip_text="Ana menü",
+        ))
+        return header
 
-    def show_error(self, msg):
+    def build_hero(self):
+        group = Adw.PreferencesGroup()
+        self.hero = Gtk.Box(spacing=16, css_classes=["card", "hero"])
+
+        self.badge = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            transition_duration=200,
+            valign=Gtk.Align.CENTER,
+            css_classes=["hero-badge"],
+        )
+        self.badge_icon = Gtk.Image(pixel_size=28)
+        self.badge.add_named(self.badge_icon, "icon")
+        self.badge.add_named(new_spinner(24), "spinner")
+        self.hero.append(self.badge)
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER, hexpand=True)
+        self.hero_title = Gtk.Label(xalign=0, wrap=True, css_classes=["title-2"])
+        self.hero_detail = Gtk.Label(xalign=0, wrap=True, css_classes=["dim-label"])
+        text.append(self.hero_title)
+        text.append(self.hero_detail)
+        self.hero.append(text)
+
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.switch.update_property([Gtk.AccessibleProperty.LABEL], ["DPI bypass"])
+        self.switch.connect("state-set", self.on_switch)
+        self.hero.append(self.switch)
+
+        group.add(self.hero)
+        return group
+
+    def build_presets(self):
+        group = Adw.PreferencesGroup(title="Hazır listeler")
+        self.preset_rows = {}
+        for name in PRESETS:
+            row = Adw.SwitchRow(title=name)
+            row.connect("notify::active", self.on_preset_toggled, name)
+            group.add(row)
+            self.preset_rows[name] = row
+        return group
+
+    def build_domains(self):
+        group = Adw.PreferencesGroup()
+        self.expander = Adw.ExpanderRow(title="Alan adları", expanded=self.app.list_expanded)
+        self.expander.connect("notify::expanded", self.on_expanded)
+        self.domain_count = Gtk.Label(css_classes=["dim-label", "numeric"])
+        self.expander.add_suffix(self.domain_count)
+
+        self.entry = Adw.EntryRow(title="Alan adı ekle", show_apply_button=True)
+        self.entry.connect("apply", self.on_add_domain)
+        self.entry.connect("entry-activated", self.on_add_domain)
+        self.entry.connect("changed", self.on_entry_changed)
+        self.expander.add_row(self.entry)
+
+        self.text_row = Adw.ActionRow(title="Metin olarak düzenle", activatable=True, action_name="app.edit-text")
+        self.text_row.add_prefix(Gtk.Image(icon_name="document-edit-symbolic"))
+        self.expander.add_row(self.text_row)
+        group.add(self.expander)
+        return group
+
+    def build_apply_bar(self):
+        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        self.changes_label = Gtk.Label(xalign=0, hexpand=True, css_classes=["dim-label"])
+        bar.append(self.changes_label)
+        bar.append(Gtk.Button(label="Geri al", action_name="app.revert"))
+
+        self.apply_content = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=150)
+        self.apply_content.add_named(Gtk.Label(label="Uygula"), "label")
+        self.apply_content.add_named(new_spinner(), "spinner")
+        bar.append(Gtk.Button(child=self.apply_content, action_name="app.apply", css_classes=["suggested-action"]))
+        return Adw.Clamp(child=bar, maximum_size=600)
+
+    # -- rendering --
+    def render(self):
+        app = self.app
+        self.rendering = True
         try:
-            dlg = Adw.AlertDialog(heading="Hata", body=msg or "Bilinmeyen hata")
-            dlg.add_response("ok", "Tamam")
-            dlg.present(self)
-        except Exception:  # noqa: BLE001
-            self.row_info.set_subtitle(msg)
+            self.render_hero()
+            enabled = enabled_presets(app.draft)
+            for name, row in self.preset_rows.items():
+                row.set_active(name in enabled)
+                row.set_sensitive(not app.busy)
+            self.render_domains(custom_domains(app.draft))
+            self.expander.set_sensitive(not app.busy)
+            self.banner.set_revealed(app.active and app.status.get("dns") != "active" and not app.busy)
+            changes = app.changes
+            self.changes_label.set_label(f"{changes} değişiklik")
+            self.apply_content.set_visible_child_name("spinner" if app.busy and changes else "label")
+            self.toolbar.set_reveal_bottom_bars(bool(changes))
+        finally:
+            self.rendering = False
 
-    def read_buffer(self):
-        buf = self.view.get_buffer()
-        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+    def render_hero(self):
+        app = self.app
+        status = app.status
+        if status is None:
+            title, detail, icon, style = "Durum alınıyor", "", "network-vpn-symbolic", None
+        elif not status:
+            title, detail = "Durum okunamadı", "Yardımcı çalıştırılamadı, kurulumu kontrol et"
+            icon, style = "dialog-warning-symbolic", "warning"
+        elif app.active:
+            title = "Bypass açık"
+            detail = f"{len(app.saved)} alan adı DPI bypass ve şifreli DNS ile açılıyor"
+            icon, style = "network-vpn-symbolic", "on"
+        else:
+            title, detail = "Bypass kapalı", "Tüm trafik normal yoldan gidiyor"
+            icon, style = "network-vpn-disabled-symbolic", None
+        if app.target is not None:
+            title, detail = ("Açılıyor" if app.target else "Kapatılıyor"), ""
+
+        self.hero_title.set_label(title)
+        self.hero_detail.set_label(detail)
+        self.hero_detail.set_visible(bool(detail))
+        self.badge_icon.set_from_icon_name(icon)
+        for name in ("on", "warning"):
+            self.hero.remove_css_class(name)
+        if style:
+            self.hero.add_css_class(style)
+        self.badge.set_visible_child_name("spinner" if app.busy or status is None else "icon")
+        self.switch.set_active(app.active if app.target is None else app.target)
+        self.switch.set_state(app.active)
+        self.switch.set_sensitive(bool(status) and not app.busy)
+
+    def render_domains(self, domains):
+        self.domain_count.set_label(str(len(domains)))
+        if domains == self.shown_custom:
+            return
+        self.shown_custom = list(domains)
+        for row in self.domain_rows:
+            self.expander.remove(row)
+        self.expander.remove(self.text_row)
+        self.domain_rows = [self.build_domain_row(d) for d in domains]
+        for row in self.domain_rows:
+            self.expander.add_row(row)
+        self.expander.add_row(self.text_row)
+
+    def build_domain_row(self, domain):
+        row = Adw.ActionRow(title=domain, use_markup=False)
+        remove = Gtk.Button(
+            icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"], tooltip_text="Kaldır",
+        )
+        remove.update_property([Gtk.AccessibleProperty.LABEL], [f"{domain} kaldır"])
+        remove.connect("clicked", lambda *_: self.app.remove_domain(domain))
+        row.add_suffix(remove)
+        return row
+
+    # -- handlers --
+    def on_close_request(self, _window):
+        self.app.on_window_closed()
+        return False
 
     def on_toggle_maximize(self, _button):
         self.unmaximize() if self.is_maximized() else self.maximize()
 
     def on_maximized_changed(self, _window, _pspec, button):
-        maximized = self.is_maximized()
-        button.set_icon_name(
-            "window-restore-symbolic" if maximized else "window-maximize-symbolic"
-        )
-
-    def on_close_request(self, _window):
-        self.get_application().hide_window(self)
-        return True
-
-    # ---------- eylemler ----------
-    def load_list(self):
-        try:
-            with open(LIST, encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError:
-            text = "discord.com\n"
-        self.view.get_buffer().set_text(text)
-        self.update_count(text)
-
-    def update_count(self, text=None):
-        if text is None:
-            text = self.read_buffer()
-        n = len([ln for ln in text.splitlines() if ln.strip()])
-        self.row_count.set_subtitle(f"{n} alan adı")
-
-    def refresh(self):
-        self._updating = True
-        res = helper(["status"])
-        values = {}
-        for line in res.stdout.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                values[k.strip()] = v.strip()
-        active = values.get("zapret") == "active"
-        dns = values.get("dns") == "active"
-        self.switch.set_active(active)
-        self._updating = False
-
-        if active:
-            self.row_state.set_subtitle("Aktif — seçili siteler DPI bypass ile açılıyor")
-        else:
-            self.row_state.set_subtitle("Kapalı — tüm trafik normal")
-        self.row_count.set_subtitle(
-            f"{len([ln for ln in self.read_buffer().splitlines() if ln.strip()])} alan adı"
-            + ("" if dns else "  ·  DNS servisi kapalı")
-        )
+        button.set_icon_name("window-restore-symbolic" if self.is_maximized() else "window-maximize-symbolic")
 
     def on_switch(self, _switch, state):
-        if self._updating:
-            return False
-        res = helper(["on"] if state else ["off"])
-        if res.returncode != 0:
-            self.show_error(res.stderr.strip())
-        else:
-            self.toast("Bypass açıldı" if state else "Bypass kapatıldı")
-        self.refresh()
-        return True
+        if not self.rendering:
+            self.app.set_enabled(state)
+        return True  # the switch follows the service state once the helper replies
 
-    def on_save(self, _btn):
-        text = self.read_buffer()
-        res = helper(["set-list"], text)
-        if res.returncode != 0:
-            self.show_error(res.stderr.strip())
+    def on_preset_toggled(self, row, _pspec, name):
+        if not self.rendering:
+            self.app.set_preset(name, row.get_active())
+
+    def on_expanded(self, row, _pspec):
+        self.app.list_expanded = row.get_expanded()
+
+    def on_entry_changed(self, entry):
+        text = entry.get_text().strip()
+        valid = not text or DOMAIN_RE.fullmatch(text) is not None
+        (entry.remove_css_class if valid else entry.add_css_class)("error")
+
+    def on_add_domain(self, entry):
+        valid, invalid = parse_domains(entry.get_text())
+        if invalid or len(valid) != 1:
+            if entry.get_text().strip():
+                entry.add_css_class("error")
             return
-        self.load_list()
-        self.refresh()
-        self.toast("Kaydedildi ve uygulandı")
-
-    def on_preset(self, _btn, domains):
-        text = self.read_buffer()
-        existing = {ln.strip() for ln in text.splitlines() if ln.strip()}
-        add = [d for d in domains if d not in existing]
-        if not add:
-            self.toast("Bu liste zaten ekli")
+        entry.set_text("")
+        if valid[0] in self.app.draft:
+            self.toast("Bu alan adı zaten listede")
             return
-        if text and not text.endswith("\n"):
-            text += "\n"
-        text += "\n".join(add) + "\n"
-        self.view.get_buffer().set_text(text)
-        self.update_count(text)
-        self.toast(f"{len(add)} alan adı eklendi — Kaydet'e bas")
+        self.app.add_domain(valid[0])
+
+    # -- dialogs and feedback --
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=2))
+
+    def show_error(self, message):
+        dialog = Adw.AlertDialog(heading="İşlem tamamlanamadı", body=message)
+        dialog.add_response("ok", "Tamam")
+        dialog.present(self)
+
+    def open_text_editor(self):
+        TextDialog(self.app).present(self)
+
+    def open_shortcuts(self):
+        dialog = Adw.ShortcutsDialog()
+        section = Adw.ShortcutsSection()
+        for title, action in (
+            ("Değişiklikleri uygula", "app.apply"),
+            ("Metin olarak düzenle", "app.edit-text"),
+            ("Tepsiye gönder", "app.hide"),
+            ("Çıkış", "app.quit"),
+            ("Klavye kısayolları", "app.shortcuts"),
+        ):
+            # Accelerators are defined once, in App.do_startup.
+            accels = self.app.get_accels_for_action(action)
+            section.add(Adw.ShortcutsItem(title=title, accelerator=" ".join(accels)))
+        dialog.add(section)
+        dialog.present(self)
+
+    def open_about(self):
+        Adw.AboutDialog(
+            application_name="Site Erişimi",
+            application_icon="network-vpn",
+            developer_name="Anıl Soylu",
+            website="https://github.com/anilsoylu/zapret-sites-gui",
+            issue_url="https://github.com/anilsoylu/zapret-sites-gui/issues",
+            license_type=Gtk.License.MIT_X11,
+        ).present(self)
 
 
-class App(Adw.Application):
-    def __init__(self):
-        super().__init__(
-            application_id="tr.anilsoylu.ZapretSites",
-            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+class TextDialog(Adw.Dialog):
+    """Bulk editor: the whole draft as plain text, one domain per line."""
+
+    def __init__(self, app):
+        super().__init__(title="Alan adları", content_width=480, content_height=560)
+        self.app = app
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+        cancel = Gtk.Button(label="İptal")
+        cancel.connect("clicked", lambda *_: self.close())
+        done = Gtk.Button(label="Tamam", css_classes=["suggested-action"])
+        done.connect("clicked", self.on_done)
+        header.pack_start(cancel)
+        header.pack_end(done)
+        toolbar.add_top_bar(header)
+        self.banner = Adw.Banner()
+        toolbar.add_top_bar(self.banner)
+
+        self.view = Gtk.TextView(
+            monospace=True, top_margin=12, bottom_margin=12, left_margin=12, right_margin=12,
         )
-        self.window = None
-        self.tray_process = None
-        self.connect("startup", self.on_startup)
-        self.connect("activate", self.on_activate)
+        self.view.get_buffer().set_text("\n".join(app.draft) + "\n")
+        toolbar.set_content(Gtk.ScrolledWindow(child=self.view, vexpand=True))
+        self.set_child(toolbar)
+        self.set_focus(self.view)
 
-    def on_startup(self, _app):
-        self.hold()
-        show_action = Gio.SimpleAction.new("show", None)
-        show_action.connect("activate", self.on_show_window)
-        self.add_action(show_action)
-        quit_action = Gio.SimpleAction.new("quit", None)
-        quit_action.connect("activate", self.quit_from_indicator)
-        self.add_action(quit_action)
-        try:
-            self.tray_process = subprocess.Popen([TRAY_HELPER])
-        except OSError as exc:
-            print(f"Tepsi göstergesi başlatılamadı: {exc}", file=sys.stderr)
-
-    def on_activate(self, _app):
-        if self.window is None:
-            self.window = Window(self)
-        elif self.window not in self.get_windows():
-            self.add_window(self.window)
-        self.window.present()
-
-    def on_show_window(self, *_args):
-        self.on_activate(self)
-
-    def hide_window(self, window):
-        window.set_visible(False)
-        if window in self.get_windows():
-            self.remove_window(window)
-
-    def quit_from_indicator(self, *_args):
-        if self.tray_process is not None:
-            self.tray_process.terminate()
-            self.tray_process = None
-        if self.window is not None:
-            self.window.set_visible(False)
-            self.remove_window(self.window)
-            self.window = None
-        self.release()
-        self.quit()
+    def on_done(self, _button):
+        buffer = self.view.get_buffer()
+        valid, invalid = parse_domains(buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False))
+        if invalid:
+            self.banner.set_title("Geçersiz: " + ", ".join(invalid[:3]) + (" …" if len(invalid) > 3 else ""))
+        elif not valid:
+            self.banner.set_title("Liste boş olamaz")
+        else:
+            self.app.replace_draft(valid)
+            self.close()
+            return
+        self.banner.set_revealed(True)
 
 
 if __name__ == "__main__":
