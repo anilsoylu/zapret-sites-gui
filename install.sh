@@ -1,28 +1,29 @@
 #!/bin/bash
-# zapret-sites-gui kurulum scripti. Ubuntu/Debian + systemd-resolved icin.
+# Installer for zapret-sites-gui. Targets Ubuntu/Debian with systemd-resolved.
 set -euo pipefail
 
 ZAPRET_VER="72.13"
 ZAPRET_URL="https://github.com/bol-van/zapret/archive/refs/tags/v${ZAPRET_VER}.tar.gz"
 ZAPRET_SHA256="04696a1b6fe766e35cd6426555520c79d5052a759cdf4d7724a1f46eba4670f6"
 PREFIX="/opt/zapret"
+HOSTLIST="$PREFIX/ipset/zapret-hosts-user.txt"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '\n==> %s\n' "$*"; }
-die() { printf 'Hata: %s\n' "$*" >&2; exit 1; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "Root gerekli. 'sudo ./install.sh' calistir."
+[ "$(id -u)" -eq 0 ] || die "Root is required. Run 'sudo ./install.sh'."
 [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ] \
-  || die "SUDO_USER bulunamadi. Scripti 'sudo ./install.sh' ile calistir."
+  || die "SUDO_USER is not set. Run the script as 'sudo ./install.sh'."
 
 TARGET_USER="$SUDO_USER"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 TARGET_GROUP="$(id -gn "$TARGET_USER")"
 
-command -v systemctl >/dev/null || die "systemd bulunamadi."
-command -v resolvectl >/dev/null || die "systemd-resolved bulunamadi."
+command -v systemctl >/dev/null || die "systemd was not found."
+command -v resolvectl >/dev/null || die "systemd-resolved was not found."
 
-log "Bagimliliklar kuruluyor"
+log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
@@ -30,25 +31,34 @@ apt-get install -y -qq \
   zlib1g-dev libcap-dev ipset iptables nftables unzip curl ca-certificates \
   python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-ayatanaappindicator3-0.1
 
-log "zapret v${ZAPRET_VER} indiriliyor"
+python3 -I - <<'EOF' || die "libadwaita 1.5 or newer is required (Ubuntu 24.04, Debian 13 or later)."
+import gi
+gi.require_version("Adw", "1")
+from gi.repository import Adw
+raise SystemExit((Adw.get_major_version(), Adw.get_minor_version()) < (1, 5))
+EOF
+
+log "Downloading zapret v${ZAPRET_VER}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "$ZAPRET_URL" -o "$TMP/zapret.tar.gz"
 echo "${ZAPRET_SHA256}  $TMP/zapret.tar.gz" | sha256sum -c - >/dev/null \
-  || die "Arsiv ozet degeri dogrulanamadi"
+  || die "Archive checksum verification failed"
 
 tar -xzf "$TMP/zapret.tar.gz" -C "$TMP"
 SRC="$TMP/zapret-${ZAPRET_VER}"
-[ -d "$SRC" ] || die "Arsiv beklenen dizini icermiyor"
+[ -d "$SRC" ] || die "Archive does not contain the expected directory"
 
-log "zapret derleniyor"
+log "Building zapret"
 systemctl stop zapret.service 2>/dev/null || true
+# Keep the user's domain list across a reinstall; rm -rf below would delete it.
+[ -f "$HOSTLIST" ] && cp "$HOSTLIST" "$TMP/hosts-user.txt"
 rm -rf "$PREFIX"
 install -d -m 755 "$PREFIX"
 cp -a "$SRC"/. "$PREFIX"/
 make -C "$PREFIX" -j"$(nproc)" >/dev/null
 
-log "Yapilandirma yaziliyor"
+log "Writing configuration"
 cp "$PREFIX/config.default" "$PREFIX/config"
 cat >> "$PREFIX/config" <<'EOF'
 
@@ -68,9 +78,13 @@ NFQWS_OPT="
 EOF
 
 install -d -m 755 "$PREFIX/ipset"
-install -m 644 "$HERE/lists/default-domains.txt" "$PREFIX/ipset/zapret-hosts-user.txt"
+if [ -f "$TMP/hosts-user.txt" ]; then
+  install -m 644 "$TMP/hosts-user.txt" "$HOSTLIST"
+else
+  install -m 644 "$HERE/lists/default-domains.txt" "$HOSTLIST"
+fi
 
-log "Dosyalar kuruluyor"
+log "Installing files"
 install -d -m 755 /usr/local/libexec /usr/local/sbin /usr/local/bin
 install -m 755 "$HERE/src/zapret-gui-helper" /usr/local/libexec/zapret-gui-helper
 install -m 755 "$HERE/src/zapret-dns-setup.sh" /usr/local/sbin/zapret-dns-setup.sh
@@ -83,16 +97,16 @@ install -d -m 755 /etc/systemd/system/systemd-resolved.service.d
 install -m 644 "$HERE/src/systemd-resolved-upholds.conf" \
   /etc/systemd/system/systemd-resolved.service.d/zapret-dns-upholds.conf
 
-log "Sudo kurali yaziliyor"
+log "Writing the sudo rule"
 printf '%s ALL=(root) NOPASSWD: /usr/local/libexec/zapret-gui-helper\n' "$TARGET_USER" \
   > /etc/sudoers.d/zapret-gui
 chmod 440 /etc/sudoers.d/zapret-gui
 if ! visudo -cf /etc/sudoers.d/zapret-gui >/dev/null; then
   rm -f /etc/sudoers.d/zapret-gui
-  die "Sudoers kurali gecersiz, dosya silindi."
+  die "The sudoers rule is invalid; the file was removed."
 fi
 
-log "Uygulama kisayolu ekleniyor"
+log "Adding the application launcher"
 DESKTOP_DIR="$TARGET_HOME/.local/share/applications"
 install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "$DESKTOP_DIR"
 cat > "$DESKTOP_DIR/zapret-sites.desktop" <<'EOF'
@@ -110,13 +124,13 @@ EOF
 chown "$TARGET_USER:$TARGET_GROUP" "$DESKTOP_DIR/zapret-sites.desktop"
 chmod 644 "$DESKTOP_DIR/zapret-sites.desktop"
 
-log "Servisler etkinlestiriliyor"
+log "Enabling services"
 systemctl daemon-reload
 systemctl enable --now zapret-dns.service
 systemctl enable --now zapret.service
 
 sleep 1
-printf '\nKurulum tamam.\n'
+printf '\nInstallation complete.\n'
 printf 'zapret: %s\n' "$(systemctl is-active zapret.service)"
 printf 'zapret-dns: %s\n' "$(systemctl is-active zapret-dns.service)"
-printf '\nArayuzu acmak icin: zapret-sites-gui\n'
+printf '\nStart the interface with: zapret-sites-gui\n'

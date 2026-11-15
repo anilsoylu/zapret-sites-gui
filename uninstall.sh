@@ -1,11 +1,11 @@
 #!/bin/bash
-# zapret-sites-gui kaldirma scripti.
+# Uninstaller for zapret-sites-gui.
 set -euo pipefail
 
 PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
-[ "$(id -u)" -eq 0 ] || { echo "Root gerekli. 'sudo ./uninstall.sh' calistir." >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "Root is required. Run 'sudo ./uninstall.sh'." >&2; exit 1; }
 
 systemctl disable --now zapret.service 2>/dev/null || true
 systemctl disable --now zapret-dns.service 2>/dev/null || true
@@ -18,7 +18,7 @@ systemctl daemon-reload
 ip link del zapretdns 2>/dev/null || true
 
 rm -f /usr/local/bin/zapret-sites-gui
-rm -f /usr/local/libexec/zapret-gui-helper
+rm -f /usr/local/libexec/zapret-gui-helper /usr/local/libexec/zapret-sites-tray
 rm -f /usr/local/sbin/zapret-dns-setup.sh /usr/local/sbin/zapret-dns-teardown.sh
 rm -f /etc/sudoers.d/zapret-gui
 
@@ -30,7 +30,7 @@ fi
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf /opt/zapret
-  echo "Kaldirildi, /opt/zapret dahil."
+  echo "Removed, including /opt/zapret."
 else
-  echo "Kaldirildi. /opt/zapret korundu, tamamen silmek icin: sudo ./uninstall.sh --purge"
+  echo "Removed. /opt/zapret was kept; to delete it too: sudo ./uninstall.sh --purge"
 fi
